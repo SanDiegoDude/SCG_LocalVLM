@@ -47,10 +47,12 @@ class Qwen2VL:
                         "Qwen2.5-VL-3B-Instruct",
                         "Qwen2.5-VL-7B-Instruct",
                         "Qwen3-VL-4B-Thinking",
+                        "Qwen3-VL-4B-Instruct"
                         "Qwen3-VL-8B-Thinking",
+                        "Qwen3-VL-8B-Instruct"
                         "SkyCaptioner-V1",
                     ],
-                    {"default": "Qwen2.5-VL-3B-Instruct"},
+                    {"default": "Qwen3-VL-4B-Instruct"},
                 ),
                 "quantization": (
                     ["none", "4bit", "8bit"],
@@ -270,8 +272,10 @@ class Qwen2:
                         "Qwen2.5-7B-Instruct",
                         "Qwen2.5-14B-Instruct",
                         "Qwen2.5-32B-Instruct",
+                        "Qwen3-4B-Thinking-2507",
+                        "Qwen3-4B-Instruct-2507"
                     ],
-                    {"default": "Qwen2.5-7B-Instruct"},
+                    {"default": "Qwen3-4B-Instruct-2507"},
                 ),
                 "quantization": (
                     ["none", "4bit", "8bit"],

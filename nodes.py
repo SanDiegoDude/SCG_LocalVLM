@@ -2,6 +2,7 @@ import os
 import torch
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
     AutoModelForCausalLM,
     AutoTokenizer,
     AutoProcessor,
@@ -23,7 +24,7 @@ def tensor_to_pil(image_tensor, batch_index=0) -> Image:
     return img
 
 
-class Qwen2VL:
+class QwenVL:
     def __init__(self):
         self.model_checkpoint = None
         self.processor = None
@@ -45,9 +46,13 @@ class Qwen2VL:
                     [
                         "Qwen2.5-VL-3B-Instruct",
                         "Qwen2.5-VL-7B-Instruct",
+                        "Qwen3-VL-4B-Thinking",
+                        "Qwen3-VL-4B-Instruct",
+                        "Qwen3-VL-8B-Thinking",
+                        "Qwen3-VL-8B-Instruct",
                         "SkyCaptioner-V1",
                     ],
-                    {"default": "Qwen2.5-VL-3B-Instruct"},
+                    {"default": "Qwen3-VL-4B-Instruct"},
                 ),
                 "quantization": (
                     ["none", "4bit", "8bit"],
@@ -133,12 +138,21 @@ class Qwen2VL:
             else:
                 quantization_config = None
 
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                self.model_checkpoint,
-                torch_dtype=torch.bfloat16 if self.bf16_support else torch.float16,
-                device_map="auto",
-                quantization_config=quantization_config,
-            )
+            # Choose the appropriate model class based on the model family
+            if model.startswith("Qwen3"):
+                self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    self.model_checkpoint,
+                    torch_dtype=torch.bfloat16 if self.bf16_support else torch.float16,
+                    device_map="auto",
+                    quantization_config=quantization_config,
+                )
+            else:
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    self.model_checkpoint,
+                    torch_dtype=torch.bfloat16 if self.bf16_support else torch.float16,
+                    device_map="auto",
+                    quantization_config=quantization_config,
+                )
 
         with torch.no_grad():
             messages = [
@@ -225,7 +239,7 @@ class Qwen2VL:
             return result
 
 
-class Qwen2:
+class Qwen:
     def __init__(self):
         self.model_checkpoint = None
         self.tokenizer = None
@@ -256,8 +270,10 @@ class Qwen2:
                         "Qwen2.5-7B-Instruct",
                         "Qwen2.5-14B-Instruct",
                         "Qwen2.5-32B-Instruct",
+                        "Qwen3-4B-Thinking-2507",
+                        "Qwen3-4B-Instruct-2507"
                     ],
-                    {"default": "Qwen2.5-7B-Instruct"},
+                    {"default": "Qwen3-4B-Instruct-2507"},
                 ),
                 "quantization": (
                     ["none", "4bit", "8bit"],

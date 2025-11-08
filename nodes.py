@@ -1,4 +1,6 @@
 import os
+import gc
+import inspect
 import torch
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
@@ -14,6 +16,42 @@ import numpy as np
 import folder_paths
 import subprocess
 import uuid
+
+try:
+    import comfy.model_management as comfy_mm
+except ImportError:  # ComfyUI runtime not available during development/tests
+    comfy_mm = None
+
+
+def _maybe_move_to_cpu(module):
+    if module is None:
+        return
+    try:
+        module.to("cpu")
+    except Exception:
+        pass
+
+
+def _clear_cuda_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    if comfy_mm is not None:
+        try:
+            soft_empty = getattr(comfy_mm, "soft_empty_cache", None)
+            if callable(soft_empty):
+                params = inspect.signature(soft_empty).parameters
+                if "force" in params:
+                    soft_empty(force=True)
+                else:
+                    soft_empty()
+                return
+            cleanup_models = getattr(comfy_mm, "cleanup_models", None)
+            if callable(cleanup_models):
+                cleanup_models()
+        except Exception:
+            pass
 
 
 def tensor_to_pil(image_tensor, batch_index=0) -> Image:
@@ -36,6 +74,12 @@ class QwenVL:
             torch.cuda.is_available()
             and torch.cuda.get_device_capability(self.device)[0] >= 8
         )
+
+    def _unload_resources(self):
+        _maybe_move_to_cpu(self.model)
+        self.model = None
+        self.processor = None
+        _clear_cuda_memory()
 
     @classmethod
     def INPUT_TYPES(s):
@@ -158,6 +202,9 @@ class QwenVL:
                     quantization_config=quantization_config,
                 )
 
+        processed_video_path = None
+        result = None
+
         with torch.no_grad():
             messages = [
                 {
@@ -168,53 +215,47 @@ class QwenVL:
                 }
             ]
 
-            if video_path:
-                print("deal video_path", video_path)
-                # 使用FFmpeg处理视频
-                unique_id = uuid.uuid4().hex  # 生成唯一标识符
-                processed_video_path = f"/tmp/processed_video_{unique_id}.mp4"  # 临时文件路径
-                ffmpeg_command = [
-                    "ffmpeg",
-                    "-i", video_path,
-                    "-vf", "fps=1,scale='min(256,iw)':min'(256,ih)':force_original_aspect_ratio=decrease",
-                    "-c:v", "libx264",
-                    "-preset", "fast",
-                    "-crf", "18",
-                    processed_video_path
-                ]
-                subprocess.run(ffmpeg_command, check=True)
-
-                # 添加处理后的视频信息到消息
-                messages[0]["content"].insert(0, {
-                    "type": "video",
-                    "video": processed_video_path,
-                })
-
-            # 处理图像输入
-            else:
-                print("deal image")
-                pil_image = tensor_to_pil(image)
-                messages[0]["content"].insert(0, {
-                    "type": "image",
-                    "image": pil_image,
-                })
-
-            # 准备输入
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            print("deal messages", messages)
-            image_inputs, video_inputs = process_vision_info(messages)
-            inputs = self.processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to("cuda")
-
-            # 推理
             try:
+                if video_path:
+                    print("deal video_path", video_path)
+                    unique_id = uuid.uuid4().hex  # 生成唯一标识符
+                    processed_video_path = f"/tmp/processed_video_{unique_id}.mp4"  # 临时文件路径
+                    ffmpeg_command = [
+                        "ffmpeg",
+                        "-i", video_path,
+                        "-vf", "fps=1,scale='min(256,iw)':min'(256,ih)':force_original_aspect_ratio=decrease",
+                        "-c:v", "libx264",
+                        "-preset", "fast",
+                        "-crf", "18",
+                        processed_video_path
+                    ]
+                    subprocess.run(ffmpeg_command, check=True)
+
+                    messages[0]["content"].insert(0, {
+                        "type": "video",
+                        "video": processed_video_path,
+                    })
+                else:
+                    print("deal image")
+                    pil_image = tensor_to_pil(image)
+                    messages[0]["content"].insert(0, {
+                        "type": "image",
+                        "image": pil_image,
+                    })
+
+                text = self.processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                print("deal messages", messages)
+                image_inputs, video_inputs = process_vision_info(messages)
+                inputs = self.processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                ).to("cuda")
+
                 generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
                 generated_ids_trimmed = [
                     out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -227,18 +268,14 @@ class QwenVL:
                 )
             except Exception as e:
                 return (f"Error during model inference: {str(e)}",)
-
-            if not keep_model_loaded:
-                del self.processor
-                del self.model
-                self.processor = None
-                self.model = None
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-
-            # 删除临时视频文件
-            if video_path:
-                os.remove(processed_video_path)
+            finally:
+                if not keep_model_loaded:
+                    self._unload_resources()
+                if processed_video_path:
+                    try:
+                        os.remove(processed_video_path)
+                    except FileNotFoundError:
+                        pass
 
             return result
 
@@ -255,6 +292,12 @@ class Qwen:
             torch.cuda.is_available()
             and torch.cuda.get_device_capability(self.device)[0] >= 8
         )
+
+    def _unload_resources(self):
+        _maybe_move_to_cpu(self.model)
+        self.model = None
+        self.tokenizer = None
+        _clear_cuda_memory()
 
     @classmethod
     def INPUT_TYPES(s):
@@ -354,36 +397,35 @@ class Qwen:
                 quantization_config=quantization_config,
             )
 
+        result = None
         with torch.no_grad():
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ]
 
-            text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            try:
+                text = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
 
-            inputs = self.tokenizer([text], return_tensors="pt").to("cuda")
+                inputs = self.tokenizer([text], return_tensors="pt").to("cuda")
 
-            generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids) :]
-                for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            result = self.tokenizer.batch_decode(
-                generated_ids_trimmed,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-                temperature=temperature,
-            )
-
-            if not keep_model_loaded:
-                del self.tokenizer
-                del self.model
-                self.tokenizer = None
-                self.model = None
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+                generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids) :]
+                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                result = self.tokenizer.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                    temperature=temperature,
+                )
+            except Exception as e:
+                return (f"Error during model inference: {str(e)}",)
+            finally:
+                if not keep_model_loaded:
+                    self._unload_resources()
 
             return result

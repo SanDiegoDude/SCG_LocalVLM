@@ -353,8 +353,8 @@ class Qwen:
         max_new_tokens,
         seed,
     ):
-        if not prompt.strip():
-            return ("Error: Prompt input is empty.",)
+        if not prompt.strip() and not system.strip():
+            return ("Error: Both system and prompt are empty.",)
 
         if seed != -1:
             torch.manual_seed(seed)

@@ -148,6 +148,27 @@ if torch is not None:
             self.assertIsNotNone(node.tokenizer)
             clear_mock.assert_not_called()
 
+        @patch("nodes.AutoModelForCausalLM.from_pretrained", return_value=DummyTextModel())
+        @patch("nodes.AutoTokenizer.from_pretrained", return_value=DummyTokenizer())
+        @patch("nodes._clear_cuda_memory")
+        def test_qwen_text_node_allows_empty_prompt_with_system(self, clear_mock, _tokenizer_mock, _model_mock):
+            self._ensure_checkpoint_path("Qwen3-4B-Instruct-2507")
+            node = nodes.Qwen()
+
+            result = node.inference(
+                system="only system prompt",
+                prompt="",
+                model="Qwen3-4B-Instruct-2507",
+                quantization="none",
+                keep_model_loaded=False,
+                temperature=0.7,
+                max_new_tokens=10,
+                seed=-1,
+            )
+
+            self.assertEqual(result, ["decoded text output"])
+            clear_mock.assert_called_once()
+
 
 else:
 

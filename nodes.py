@@ -17,11 +17,64 @@ import numpy as np
 import folder_paths
 import subprocess
 import uuid
+import time  # Import at module level for timing
 
 try:
     import comfy.model_management as comfy_mm
 except ImportError:  # ComfyUI runtime not available during development/tests
     comfy_mm = None
+def _check_quantization_support():
+    """Check if quantization kernels are available and working."""
+    if not torch.cuda.is_available():
+        return False, "CUDA not available"
+    
+    try:
+        import bitsandbytes as bnb
+        # Test if CUDA kernels are available
+        test_tensor = torch.randn(10, 10).cuda()
+        try:
+            # Try to use quantization kernel
+            from bitsandbytes.functional import quantize_4bit
+            quantize_4bit(test_tensor)
+            return True, "Quantization kernels available"
+        except Exception as e:
+            return False, f"Quantization kernels not working: {e}"
+    except ImportError:
+        return False, "bitsandbytes not installed"
+
+
+def _get_gpu_info():
+    """Get GPU compute capability and check Flash Attention 2 optimization status.
+    
+    Returns info about whether FA2 is likely OPTIMAL for this GPU (hint, not blocker).
+    FA2 may still work on newer GPUs even if not fully optimized yet.
+    """
+    if not torch.cuda.is_available():
+        return None, None, True  # Assume compatible if we can't check
+    
+    try:
+        device = torch.device("cuda:0")
+        props = torch.cuda.get_device_properties(device)
+        major, minor = props.major, props.minor
+        compute_cap = f"{major}.{minor}"
+        gpu_name = props.name
+        
+        # FA2 is optimized for SM 80-90 (Ampere, Ada, Hopper)
+        # Newer architectures (SM 120+ Blackwell) may not have optimized kernels yet
+        # But this could change with future FA2 updates
+        sm_version = major * 10 + minor
+        fa2_optimized = 80 <= sm_version <= 90
+        
+        return gpu_name, compute_cap, fa2_optimized
+    except Exception:
+        return None, None, True  # Assume compatible if we can't check
+
+
+# Get GPU info at module load time
+_GPU_NAME, _GPU_COMPUTE_CAP, _FA2_OPTIMIZED = _get_gpu_info()
+if _GPU_NAME:
+    print(f"[SCG_LocalVLM] GPU: {_GPU_NAME} (SM {_GPU_COMPUTE_CAP})")
+
 
 
 # --- Custom Models Loading ---
@@ -178,14 +231,35 @@ def _clear_cuda_memory():
 
 
 def tensor_to_pil(image_tensor, batch_index=0) -> Image:
-    # Convert tensor of shape [batch, height, width, channels] at the batch_index to PIL Image
-    image_tensor = image_tensor[batch_index].unsqueeze(0)
-    i = 255.0 * image_tensor.cpu().numpy()
-    img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8).squeeze())
+    """Convert ComfyUI tensor to PIL Image with minimal CPU transfer."""
+    # Extract single image from batch
+    image_tensor = image_tensor[batch_index]
+
+    # Perform scaling and clamping on GPU before CPU transfer
+    img_data = (image_tensor * 255.0).clamp(0, 255).byte()
+
+    # Single CPU transfer at the very end
+    img_np = img_data.cpu().numpy()
+
+    # Convert to PIL
+    img = Image.fromarray(img_np)
     return img
 
 
 class QwenVL:
+    """
+    Qwen Vision-Language Model Node for ComfyUI
+
+    Supports Qwen2.5-VL and Qwen3-VL models with:
+    - Multi-image input (up to 4 images)
+    - Video input via FFmpeg processing
+    - Multiple quantization options (none, 4bit, 8bit)
+    - Advanced generation parameters
+    - Flash Attention 2 optimization
+
+    ComfyUI v2/v3 compatible.
+    """
+
     def __init__(self):
         self.model_checkpoint = None
         self.processor = None
@@ -224,19 +298,36 @@ class QwenVL:
                     ["none", "4bit", "8bit"],
                     {"default": "none"},
                 ),
+                "attention_mode": (
+                    ["auto", "flash_attention_2", "sdpa", "eager"],
+                    {"default": "auto"},
+                ),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
                 "bypass": ("BOOLEAN", {"default": False}),
+                "do_sample": ("BOOLEAN", {"default": True}),
                 "temperature": (
                     "FLOAT",
-                    {"default": 0.7, "min": 0, "max": 1, "step": 0.1},
+                    {"default": 0.7, "min": 0, "max": 2, "step": 0.05},
+                ),
+                "top_p": (
+                    "FLOAT",
+                    {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "top_k": (
+                    "INT",
+                    {"default": 50, "min": 0, "max": 200, "step": 1},
+                ),
+                "min_p": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "repetition_penalty": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 1.0, "max": 2.0, "step": 0.05},
                 ),
                 "max_new_tokens": (
                     "INT",
                     {"default": 512, "min": 128, "max": 8000, "step": 1},
-                ),
-                "repetition_penalty": (
-                    "FLOAT",
-                    {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.05},
                 ),
                 "seed": ("INT", {"default": -1}),
             },
@@ -250,6 +341,7 @@ class QwenVL:
         }
 
     RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
     FUNCTION = "inference"
     CATEGORY = "Comfyui_QwenVL"
 
@@ -259,11 +351,16 @@ class QwenVL:
         text,
         model,
         quantization,
+        attention_mode,
         keep_model_loaded,
         bypass,
+        do_sample,
         temperature,
-        max_new_tokens,
+        top_p,
+        top_k,
+        min_p,
         repetition_penalty,
+        max_new_tokens,
         seed,
         image1=None,
         image2=None,
@@ -306,10 +403,29 @@ class QwenVL:
             )
 
         if self.model is None:
-            # Determine compute dtype for quantization
-            compute_dtype = torch.bfloat16 if self.bf16_support else torch.float16
+            load_start = time.time()
             
-            # Build load kwargs based on quantization mode
+            # Check quantization support if using quantization
+            if quantization != "none":
+                quant_ok, quant_msg = _check_quantization_support()
+                if not quant_ok:
+                    print(f"[SCG_LocalVLM] WARNING: {quant_msg}")
+                    print("[SCG_LocalVLM] Falling back to unquantized loading")
+                    quantization = "none"
+                else:
+                    print(f"[SCG_LocalVLM] {quant_msg}")
+            
+            # Determine compute dtype
+            compute_dtype = torch.bfloat16 if self.bf16_support else torch.float16
+            print(f"[SCG_LocalVLM] Using compute dtype: {compute_dtype}")
+
+            # Build load_kwargs - SIMPLIFIED for maximum performance
+            # For non-quantized: use native PyTorch loading (no device_map overhead)
+            # For quantized: need device_map for bitsandbytes
+            load_kwargs = {
+                "torch_dtype": compute_dtype,
+            }
+            
             if quantization == "4bit":
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -317,46 +433,131 @@ class QwenVL:
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
                 )
-                load_kwargs = {
-                    "torch_dtype": compute_dtype,
-                    "device_map": "auto",
-                    "quantization_config": quantization_config,
-                }
+                load_kwargs["quantization_config"] = quantization_config
+                # Use explicit GPU placement to avoid Accelerate memory management overhead
+                load_kwargs["device_map"] = {"": 0} if torch.cuda.device_count() == 1 else "auto"
+                print(f"[SCG_LocalVLM] Loading with 4-bit quantization")
+                
             elif quantization == "8bit":
                 quantization_config = BitsAndBytesConfig(
                     load_in_8bit=True,
                     bnb_8bit_compute_dtype=compute_dtype,
                 )
-                load_kwargs = {
-                    "torch_dtype": compute_dtype,
-                    "device_map": "auto",
-                    "quantization_config": quantization_config,
-                }
+                load_kwargs["quantization_config"] = quantization_config
+                load_kwargs["device_map"] = {"": 0} if torch.cuda.device_count() == 1 else "auto"
+                print(f"[SCG_LocalVLM] Loading with 8-bit quantization")
+                
             else:
-                # No quantization - use low_cpu_mem_usage to load directly to GPU
-                load_kwargs = {
-                    "torch_dtype": compute_dtype,
-                    "device_map": "auto",
-                    "low_cpu_mem_usage": True,
-                }
+                # Non-quantized: load directly to GPU for maximum speed
+                load_kwargs["device_map"] = {"": "cuda:0"}
+                print("[SCG_LocalVLM] Loading without quantization")
 
-            # Choose the appropriate model class based on the model family
-            model_class = _get_model_class(model, is_vl=True)
-            if model_class == "Qwen3":
-                self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                    self.model_checkpoint,
-                    **load_kwargs,
-                )
+            # Handle attention mode
+            if attention_mode == "flash_attention_2":
+                try:
+                    import flash_attn
+                    load_kwargs["attn_implementation"] = "flash_attention_2"
+                    attention_used = "flash_attention_2"
+                    if not _FA2_OPTIMIZED:
+                        print(f"[SCG_LocalVLM] Using Flash Attention 2 (may not be optimal for {_GPU_NAME or 'this GPU'})")
+                    else:
+                        print("[SCG_LocalVLM] Using Flash Attention 2")
+                except ImportError:
+                    print("[SCG_LocalVLM] flash-attn not installed, using SDPA instead")
+                    load_kwargs["attn_implementation"] = "sdpa"
+                    attention_used = "sdpa"
+            elif attention_mode == "sdpa":
+                load_kwargs["attn_implementation"] = "sdpa"
+                attention_used = "sdpa"
+                print("[SCG_LocalVLM] Using SDPA attention")
+            elif attention_mode == "eager":
+                load_kwargs["attn_implementation"] = "eager"
+                attention_used = "eager"
+                print("[SCG_LocalVLM] Using eager attention")
             else:
-                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    self.model_checkpoint,
-                    **load_kwargs,
-                )
+                # auto - use sdpa as default (best compatibility + good performance)
+                load_kwargs["attn_implementation"] = "sdpa"
+                attention_used = "sdpa"
+                print("[SCG_LocalVLM] Using SDPA attention (auto)")
+
+            # Load the model
+            model_class = _get_model_class(model, is_vl=True)
+            print(f"[SCG_LocalVLM] Loading {model_class} model from {self.model_checkpoint}")
+            
+            try:
+                if model_class == "Qwen3":
+                    self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        self.model_checkpoint,
+                        **load_kwargs,
+                    )
+                else:
+                    self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        self.model_checkpoint,
+                        **load_kwargs,
+                    )
+                
+                load_time = time.time() - load_start
+                
+                # Set model to eval mode
+                self.model.eval()
+                
+                # Print comprehensive model info
+                print(f"[SCG_LocalVLM] Model loaded successfully in {load_time:.2f}s")
+                print(f"[SCG_LocalVLM]   Device: {self.model.device}")
+                print(f"[SCG_LocalVLM]   Dtype: {self.model.dtype}")
+                print(f"[SCG_LocalVLM]   Attention: {attention_used}")
+                
+                # Verify actual attention implementation
+                if hasattr(self.model.config, '_attn_implementation'):
+                    actual_attn = self.model.config._attn_implementation
+                    print(f"[SCG_LocalVLM]   Attention (verified): {actual_attn}")
+                
+                # Show quantization info
+                if quantization != "none":
+                    print(f"[SCG_LocalVLM]   Quantization: {quantization}")
+                    if hasattr(self.model, 'hf_device_map'):
+                        print(f"[SCG_LocalVLM]   Device map: {self.model.hf_device_map}")
+                    
+                    # Check if model is actually quantized
+                    is_quantized = False
+                    for name, param in self.model.named_parameters():
+                        if hasattr(param, 'quant_state'):
+                            is_quantized = True
+                            break
+                    
+                    if is_quantized:
+                        print(f"[SCG_LocalVLM]   Quantization: VERIFIED (layers are quantized)")
+                    else:
+                        print(f"[SCG_LocalVLM]   WARNING: Quantization requested but layers not quantized!")
+                        
+            except Exception as e:
+                print(f"[SCG_LocalVLM] Error loading model: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+                
+                # Try fallback without attention implementation
+                if "attn_implementation" in load_kwargs:
+                    print(f"[SCG_LocalVLM] Retrying without {attention_mode} attention...")
+                    load_kwargs.pop("attn_implementation", None)
+                    
+                    if model_class == "Qwen3":
+                        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                            self.model_checkpoint,
+                            **load_kwargs,
+                        )
+                    else:
+                        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                            self.model_checkpoint,
+                            **load_kwargs,
+                        )
+                    print("[SCG_LocalVLM] Model loaded with fallback attention")
+                else:
+                    raise
 
         processed_video_path = None
         result = None
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Build user content list - images first (in order), then text
             user_content = []
             
@@ -411,6 +612,8 @@ class QwenVL:
                 )
                 print("deal messages", messages)
                 image_inputs, video_inputs = process_vision_info(messages)
+                
+                # Process inputs on CPU first
                 inputs = self.processor(
                     text=[text],
                     images=image_inputs,
@@ -419,22 +622,81 @@ class QwenVL:
                     return_tensors="pt",
                 ).to(self.model.device)
 
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    repetition_penalty=repetition_penalty,
-                )
+                # Build generation kwargs with optimal settings
+                generation_kwargs = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": do_sample,
+                    "use_cache": True,  # CRITICAL: Enable KV cache for fast generation
+                    "num_beams": 1,  # Greedy/sampling is faster than beam search
+                }
+
+                # Add pad_token_id to prevent warnings
+                if hasattr(self.processor, 'tokenizer'):
+                    if hasattr(self.processor.tokenizer, 'pad_token_id') and self.processor.tokenizer.pad_token_id is not None:
+                        generation_kwargs["pad_token_id"] = self.processor.tokenizer.pad_token_id
+                    elif hasattr(self.processor.tokenizer, 'eos_token_id') and self.processor.tokenizer.eos_token_id is not None:
+                        generation_kwargs["pad_token_id"] = self.processor.tokenizer.eos_token_id
+
+                # Add sampling parameters only if do_sample is True
+                if do_sample:
+                    if temperature > 0:
+                        generation_kwargs["temperature"] = temperature
+                    if top_p < 1.0:
+                        generation_kwargs["top_p"] = top_p
+                    if top_k > 0:
+                        generation_kwargs["top_k"] = top_k
+                    if min_p > 0:
+                        generation_kwargs["min_p"] = min_p
+
+                # Always apply repetition penalty if not default
+                if repetition_penalty != 1.0:
+                    generation_kwargs["repetition_penalty"] = repetition_penalty
+
+                gen_start = time.time()
+                generated_ids = self.model.generate(**inputs, **generation_kwargs)
+                gen_time = time.time() - gen_start
+
                 generated_ids_trimmed = [
                     out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
                 ]
+
+                # Calculate tokens/sec
+                if len(generated_ids_trimmed) > 0:
+                    tokens_generated = len(generated_ids_trimmed[0])
+                    tokens_per_sec = tokens_generated / gen_time if gen_time > 0 else 0
+                    print(f"[SCG_LocalVLM] Generation Performance:")
+                    print(f"[SCG_LocalVLM]   Tokens: {tokens_generated}")
+                    print(f"[SCG_LocalVLM]   Time: {gen_time:.2f}s")
+                    print(f"[SCG_LocalVLM]   Speed: {tokens_per_sec:.2f} tokens/sec")
+                    
+                    # Add performance analysis
+                    if quantization == "4bit" and tokens_per_sec < 10:
+                        print(f"[SCG_LocalVLM] WARNING: 4bit performance unusually slow!")
+                        print(f"[SCG_LocalVLM] Expected: 40-60 tok/s, Got: {tokens_per_sec:.2f} tok/s")
+                        print(f"[SCG_LocalVLM] Possible issues:")
+                        print(f"[SCG_LocalVLM]   - Quantization kernels not properly compiled")
+                        print(f"[SCG_LocalVLM]   - CUDA/PyTorch version mismatch")
+                        print(f"[SCG_LocalVLM]   - Try: pip install bitsandbytes --upgrade")
+
                 result = self.processor.batch_decode(
                     generated_ids_trimmed,
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
-                    temperature=temperature,
+                )
+            except torch.cuda.OutOfMemoryError as e:
+                _clear_cuda_memory()
+                return (
+                    f"[SCG_LocalVLM] CUDA Out of Memory Error. "
+                    f"Try: 1) Enable quantization (4bit/8bit), "
+                    f"2) Reduce max_new_tokens, "
+                    f"3) Use a smaller model. "
+                    f"Error: {str(e)}",
                 )
             except Exception as e:
-                return (f"Error during model inference: {str(e)}",)
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"[SCG_LocalVLM] Error during inference:\n{error_details}")
+                return (f"[SCG_LocalVLM] Error during model inference: {str(e)}",)
             finally:
                 if not keep_model_loaded:
                     self._unload_resources()
@@ -448,6 +710,18 @@ class QwenVL:
 
 
 class Qwen:
+    """
+    Qwen Text-Only Language Model Node for ComfyUI
+
+    Supports Qwen2.5 and Qwen3 text generation models with:
+    - Multiple quantization options (none, 4bit, 8bit)
+    - Advanced generation parameters
+    - Flash Attention 2 optimization
+    - System and user prompt support
+
+    ComfyUI v2/v3 compatible.
+    """
+
     def __init__(self):
         self.model_checkpoint = None
         self.tokenizer = None
@@ -485,26 +759,44 @@ class Qwen:
                 "quantization": (
                     ["none", "4bit", "8bit"],
                     {"default": "none"},
-                ),  # add quantization type selection
+                ),
+                "attention_mode": (
+                    ["auto", "flash_attention_2", "sdpa", "eager"],
+                    {"default": "auto"},
+                ),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
                 "bypass": ("BOOLEAN", {"default": False}),
+                "do_sample": ("BOOLEAN", {"default": True}),
                 "temperature": (
                     "FLOAT",
-                    {"default": 0.7, "min": 0, "max": 1, "step": 0.1},
+                    {"default": 0.7, "min": 0, "max": 2, "step": 0.05},
+                ),
+                "top_p": (
+                    "FLOAT",
+                    {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "top_k": (
+                    "INT",
+                    {"default": 50, "min": 0, "max": 200, "step": 1},
+                ),
+                "min_p": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "repetition_penalty": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 1.0, "max": 2.0, "step": 0.05},
                 ),
                 "max_new_tokens": (
                     "INT",
                     {"default": 512, "min": 128, "max": 8000, "step": 1},
                 ),
-                "repetition_penalty": (
-                    "FLOAT",
-                    {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.05},
-                ),
-                "seed": ("INT", {"default": -1}),  # add seed parameter, default is -1
+                "seed": ("INT", {"default": -1}),
             },
         }
 
     RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
     FUNCTION = "inference"
     CATEGORY = "Comfyui_QwenVL"
 
@@ -514,11 +806,16 @@ class Qwen:
         prompt,
         model,
         quantization,
+        attention_mode,
         keep_model_loaded,
         bypass,
+        do_sample,
         temperature,
-        max_new_tokens,
+        top_p,
+        top_k,
+        min_p,
         repetition_penalty,
+        max_new_tokens,
         seed,
     ):
         # Bypass mode: pass prompt directly to output without model inference
@@ -548,10 +845,27 @@ class Qwen:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_checkpoint)
 
         if self.model is None:
-            # Determine compute dtype for quantization
-            compute_dtype = torch.bfloat16 if self.bf16_support else torch.float16
+            load_start = time.time()
             
-            # Build load kwargs based on quantization mode
+            # Check quantization support if using quantization
+            if quantization != "none":
+                quant_ok, quant_msg = _check_quantization_support()
+                if not quant_ok:
+                    print(f"[SCG_LocalVLM] WARNING: {quant_msg}")
+                    print("[SCG_LocalVLM] Falling back to unquantized loading")
+                    quantization = "none"
+                else:
+                    print(f"[SCG_LocalVLM] {quant_msg}")
+            
+            # Determine compute dtype
+            compute_dtype = torch.bfloat16 if self.bf16_support else torch.float16
+            print(f"[SCG_LocalVLM] Using compute dtype: {compute_dtype}")
+
+            # Build load_kwargs - SIMPLIFIED for maximum performance
+            load_kwargs = {
+                "torch_dtype": compute_dtype,
+            }
+            
             if quantization == "4bit":
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -559,36 +873,110 @@ class Qwen:
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
                 )
-                load_kwargs = {
-                    "torch_dtype": compute_dtype,
-                    "device_map": "auto",
-                    "quantization_config": quantization_config,
-                }
+                load_kwargs["quantization_config"] = quantization_config
+                load_kwargs["device_map"] = "auto"
+                print(f"[SCG_LocalVLM] Loading with 4-bit quantization")
+                
             elif quantization == "8bit":
                 quantization_config = BitsAndBytesConfig(
                     load_in_8bit=True,
                     bnb_8bit_compute_dtype=compute_dtype,
                 )
-                load_kwargs = {
-                    "torch_dtype": compute_dtype,
-                    "device_map": "auto",
-                    "quantization_config": quantization_config,
-                }
+                load_kwargs["quantization_config"] = quantization_config
+                load_kwargs["device_map"] = "auto"
+                print(f"[SCG_LocalVLM] Loading with 8-bit quantization")
+                
             else:
-                # No quantization - use low_cpu_mem_usage to load directly to GPU
-                load_kwargs = {
-                    "torch_dtype": compute_dtype,
-                    "device_map": "auto",
-                    "low_cpu_mem_usage": True,
-                }
+                # Non-quantized: NO device_map - use native PyTorch loading
+                print("[SCG_LocalVLM] Loading without quantization (native PyTorch)")
 
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_checkpoint,
-                **load_kwargs,
-            )
+            # Handle attention mode - simplified
+            if attention_mode == "flash_attention_2" and _FA2_COMPATIBLE:
+                try:
+                    import flash_attn
+                    load_kwargs["attn_implementation"] = "flash_attention_2"
+                    attention_used = "flash_attention_2"
+                except ImportError:
+                    load_kwargs["attn_implementation"] = "sdpa"
+                    attention_used = "sdpa"
+            elif attention_mode == "sdpa" or (attention_mode == "flash_attention_2" and not _FA2_COMPATIBLE):
+                load_kwargs["attn_implementation"] = "sdpa"
+                attention_used = "sdpa"
+            elif attention_mode == "eager":
+                load_kwargs["attn_implementation"] = "eager"
+                attention_used = "eager"
+            else:
+                load_kwargs["attn_implementation"] = "sdpa"
+                attention_used = "sdpa"
+            
+            print(f"[SCG_LocalVLM] Using {attention_used} attention")
+
+            # Load the model
+            print(f"[SCG_LocalVLM] Loading model from {self.model_checkpoint}")
+            
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_checkpoint,
+                    **load_kwargs,
+                )
+                
+                load_time = time.time() - load_start
+                
+                # For non-quantized: move to GPU
+                if quantization == "none":
+                    self.model = self.model.cuda()
+                
+                self.model.eval()
+                
+                # Print comprehensive model info
+                print(f"[SCG_LocalVLM] Model loaded successfully in {load_time:.2f}s")
+                print(f"[SCG_LocalVLM]   Device: {self.model.device}")
+                print(f"[SCG_LocalVLM]   Dtype: {self.model.dtype}")
+                print(f"[SCG_LocalVLM]   Attention: {attention_used}")
+                
+                # Verify actual attention implementation
+                if hasattr(self.model.config, '_attn_implementation'):
+                    actual_attn = self.model.config._attn_implementation
+                    print(f"[SCG_LocalVLM]   Attention (verified): {actual_attn}")
+                
+                # Show quantization info
+                if quantization != "none":
+                    print(f"[SCG_LocalVLM]   Quantization: {quantization}")
+                    if hasattr(self.model, 'hf_device_map'):
+                        print(f"[SCG_LocalVLM]   Device map: {self.model.hf_device_map}")
+                    
+                    # Check if model is actually quantized
+                    is_quantized = False
+                    for name, param in self.model.named_parameters():
+                        if hasattr(param, 'quant_state'):
+                            is_quantized = True
+                            break
+                    
+                    if is_quantized:
+                        print(f"[SCG_LocalVLM]   Quantization: VERIFIED (layers are quantized)")
+                    else:
+                        print(f"[SCG_LocalVLM]   WARNING: Quantization requested but layers not quantized!")
+                        
+            except Exception as e:
+                print(f"[SCG_LocalVLM] Error loading model: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+                
+                # Try fallback without attention implementation
+                if "attn_implementation" in load_kwargs:
+                    print(f"[SCG_LocalVLM] Retrying without {attention_mode} attention...")
+                    load_kwargs.pop("attn_implementation", None)
+                    
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        self.model_checkpoint,
+                        **load_kwargs,
+                    )
+                    print("[SCG_LocalVLM] Model loaded with fallback attention")
+                else:
+                    raise
 
         result = None
-        with torch.no_grad():
+        with torch.inference_mode():
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
@@ -601,23 +989,76 @@ class Qwen:
 
                 inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
 
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    repetition_penalty=repetition_penalty,
-                )
+                # Build generation kwargs with proper parameter handling
+                generation_kwargs = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": do_sample,
+                    "use_cache": True,  # CRITICAL: Enable KV cache
+                }
+
+                # Add pad_token_id to prevent warnings and improve batching
+                if hasattr(self.tokenizer, 'pad_token_id') and self.tokenizer.pad_token_id is not None:
+                    generation_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+                elif hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
+                    generation_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
+
+                # Add sampling parameters only if do_sample is True
+                if do_sample:
+                    if temperature > 0:
+                        generation_kwargs["temperature"] = temperature
+                    if top_p < 1.0:
+                        generation_kwargs["top_p"] = top_p
+                    if top_k > 0:
+                        generation_kwargs["top_k"] = top_k
+                    if min_p > 0:
+                        generation_kwargs["min_p"] = min_p
+
+                # Always apply repetition penalty if not default
+                if repetition_penalty != 1.0:
+                    generation_kwargs["repetition_penalty"] = repetition_penalty
+
+                # Start timing
+                import time
+                gen_start = time.time()
+
+                generated_ids = self.model.generate(**inputs, **generation_kwargs)
+
+                # Calculate performance
+                gen_time = time.time() - gen_start
+
                 generated_ids_trimmed = [
                     out_ids[len(in_ids) :]
                     for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
                 ]
+
+                # Calculate tokens/sec
+                if len(generated_ids_trimmed) > 0:
+                    tokens_generated = len(generated_ids_trimmed[0])
+                    tokens_per_sec = tokens_generated / gen_time if gen_time > 0 else 0
+                    print(f"[SCG_LocalVLM] Generation Performance:")
+                    print(f"[SCG_LocalVLM]   Tokens: {tokens_generated}")
+                    print(f"[SCG_LocalVLM]   Time: {gen_time:.2f}s")
+                    print(f"[SCG_LocalVLM]   Speed: {tokens_per_sec:.2f} tokens/sec")
+
                 result = self.tokenizer.batch_decode(
                     generated_ids_trimmed,
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
-                    temperature=temperature,
+                )
+            except torch.cuda.OutOfMemoryError as e:
+                _clear_cuda_memory()
+                return (
+                    f"[SCG_LocalVLM] CUDA Out of Memory Error. "
+                    f"Try: 1) Enable quantization (4bit/8bit), "
+                    f"2) Reduce max_new_tokens, "
+                    f"3) Use a smaller model. "
+                    f"Error: {str(e)}",
                 )
             except Exception as e:
-                return (f"Error during model inference: {str(e)}",)
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"[SCG_LocalVLM] Error during inference:\n{error_details}")
+                return (f"[SCG_LocalVLM] Error during model inference: {str(e)}",)
             finally:
                 if not keep_model_loaded:
                     self._unload_resources()

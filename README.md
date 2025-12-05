@@ -13,6 +13,21 @@ This repository provides ComfyUI nodes that wrap the latest vision-language and 
 - Retained compatibility with existing Qwen2.5 VL models
 - Text-only workflows support both Qwen2.5 and Qwen3 instruct checkpoints
 
+## Performance & Attention Modes
+
+**Attention Mode Options:** `auto`, `sdpa`, `flash_attention_2`, `eager`
+
+| Mode | Recommendation |
+|------|----------------|
+| `sdpa` | **Recommended** - Best compatibility and performance on most GPUs |
+| `flash_attention_2` | Fastest on SM 80-90 GPUs (RTX 30/40 series). Requires `pip install flash-attn` |
+| `eager` | Fallback for compatibility issues |
+| `auto` | Defaults to SDPA |
+
+**Quantization Notes:**
+- Non-quantized with SDPA: ~17 tokens/sec on RTX 5090
+- 4-bit quantization: May be slower on newer GPUs (Blackwell) due to kernel compatibility
+
 ## Sample Workflows
 
 - Multimodal workflow example: [`workflow/Qwen2VL.json`](workflow/Qwen2VL.json)

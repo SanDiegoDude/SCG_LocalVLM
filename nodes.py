@@ -226,9 +226,26 @@ class QwenVL:
                 ),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
                 "bypass": ("BOOLEAN", {"default": False}),
+                "do_sample": ("BOOLEAN", {"default": True}),
                 "temperature": (
                     "FLOAT",
-                    {"default": 0.7, "min": 0, "max": 1, "step": 0.1},
+                    {"default": 0.7, "min": 0, "max": 2, "step": 0.05},
+                ),
+                "top_p": (
+                    "FLOAT",
+                    {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "top_k": (
+                    "INT",
+                    {"default": 50, "min": 0, "max": 200, "step": 1},
+                ),
+                "min_p": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "repetition_penalty": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 1.0, "max": 2.0, "step": 0.05},
                 ),
                 "max_new_tokens": (
                     "INT",
@@ -246,6 +263,7 @@ class QwenVL:
         }
 
     RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
     FUNCTION = "inference"
     CATEGORY = "Comfyui_QwenVL"
 
@@ -257,7 +275,12 @@ class QwenVL:
         quantization,
         keep_model_loaded,
         bypass,
+        do_sample,
         temperature,
+        top_p,
+        top_k,
+        min_p,
+        repetition_penalty,
         max_new_tokens,
         seed,
         image1=None,
@@ -303,7 +326,7 @@ class QwenVL:
         if self.model is None:
             # Determine compute dtype for quantization
             compute_dtype = torch.bfloat16 if self.bf16_support else torch.float16
-            
+
             # Load the model on the available device(s)
             if quantization == "4bit":
                 quantization_config = BitsAndBytesConfig(
@@ -312,34 +335,52 @@ class QwenVL:
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
                 )
+                load_kwargs = {
+                    "quantization_config": quantization_config,
+                    "device_map": "auto",
+                }
             elif quantization == "8bit":
                 quantization_config = BitsAndBytesConfig(
                     load_in_8bit=True,
+                    bnb_8bit_compute_dtype=compute_dtype,
                 )
+                load_kwargs = {
+                    "quantization_config": quantization_config,
+                    "device_map": "auto",
+                }
             else:
-                quantization_config = None
+                # No quantization - load with optimal settings
+                load_kwargs = {
+                    "torch_dtype": compute_dtype,
+                    "device_map": "auto",
+                    "low_cpu_mem_usage": True,
+                }
+
+            # Try to use Flash Attention 2 for better performance (optional)
+            if torch.cuda.is_available():
+                try:
+                    load_kwargs["attn_implementation"] = "flash_attention_2"
+                except Exception:
+                    # Flash Attention not available, will use default
+                    pass
 
             # Choose the appropriate model class based on the model family
             model_class = _get_model_class(model, is_vl=True)
             if model_class == "Qwen3":
                 self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                     self.model_checkpoint,
-                    torch_dtype=compute_dtype,
-                    device_map="auto",
-                    quantization_config=quantization_config,
+                    **load_kwargs,
                 )
             else:
                 self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     self.model_checkpoint,
-                    torch_dtype=compute_dtype,
-                    device_map="auto",
-                    quantization_config=quantization_config,
+                    **load_kwargs,
                 )
 
         processed_video_path = None
         result = None
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Build user content list - images first (in order), then text
             user_content = []
             
@@ -400,9 +441,30 @@ class QwenVL:
                     videos=video_inputs,
                     padding=True,
                     return_tensors="pt",
-                ).to("cuda")
+                ).to(self.model.device)
 
-                generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+                # Build generation kwargs with proper parameter handling
+                generation_kwargs = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": do_sample,
+                }
+
+                # Add sampling parameters only if do_sample is True
+                if do_sample:
+                    if temperature > 0:
+                        generation_kwargs["temperature"] = temperature
+                    if top_p < 1.0:
+                        generation_kwargs["top_p"] = top_p
+                    if top_k > 0:
+                        generation_kwargs["top_k"] = top_k
+                    if min_p > 0:
+                        generation_kwargs["min_p"] = min_p
+
+                # Always apply repetition penalty if not default
+                if repetition_penalty != 1.0:
+                    generation_kwargs["repetition_penalty"] = repetition_penalty
+
+                generated_ids = self.model.generate(**inputs, **generation_kwargs)
                 generated_ids_trimmed = [
                     out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
                 ]
@@ -410,10 +472,21 @@ class QwenVL:
                     generated_ids_trimmed,
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
-                    temperature=temperature,
+                )
+            except torch.cuda.OutOfMemoryError as e:
+                _clear_cuda_memory()
+                return (
+                    f"[SCG_LocalVLM] CUDA Out of Memory Error. "
+                    f"Try: 1) Enable quantization (4bit/8bit), "
+                    f"2) Reduce max_new_tokens, "
+                    f"3) Use a smaller model. "
+                    f"Error: {str(e)}",
                 )
             except Exception as e:
-                return (f"Error during model inference: {str(e)}",)
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"[SCG_LocalVLM] Error during inference:\n{error_details}")
+                return (f"[SCG_LocalVLM] Error during model inference: {str(e)}",)
             finally:
                 if not keep_model_loaded:
                     self._unload_resources()
@@ -464,22 +537,40 @@ class Qwen:
                 "quantization": (
                     ["none", "4bit", "8bit"],
                     {"default": "none"},
-                ),  # add quantization type selection
+                ),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
                 "bypass": ("BOOLEAN", {"default": False}),
+                "do_sample": ("BOOLEAN", {"default": True}),
                 "temperature": (
                     "FLOAT",
-                    {"default": 0.7, "min": 0, "max": 1, "step": 0.1},
+                    {"default": 0.7, "min": 0, "max": 2, "step": 0.05},
+                ),
+                "top_p": (
+                    "FLOAT",
+                    {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "top_k": (
+                    "INT",
+                    {"default": 50, "min": 0, "max": 200, "step": 1},
+                ),
+                "min_p": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+                "repetition_penalty": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 1.0, "max": 2.0, "step": 0.05},
                 ),
                 "max_new_tokens": (
                     "INT",
                     {"default": 512, "min": 128, "max": 8000, "step": 1},
                 ),
-                "seed": ("INT", {"default": -1}),  # add seed parameter, default is -1
+                "seed": ("INT", {"default": -1}),
             },
         }
 
     RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
     FUNCTION = "inference"
     CATEGORY = "Comfyui_QwenVL"
 
@@ -491,7 +582,12 @@ class Qwen:
         quantization,
         keep_model_loaded,
         bypass,
+        do_sample,
         temperature,
+        top_p,
+        top_k,
+        min_p,
+        repetition_penalty,
         max_new_tokens,
         seed,
     ):
@@ -524,7 +620,7 @@ class Qwen:
         if self.model is None:
             # Determine compute dtype for quantization
             compute_dtype = torch.bfloat16 if self.bf16_support else torch.float16
-            
+
             # Load the model on the available device(s)
             if quantization == "4bit":
                 quantization_config = BitsAndBytesConfig(
@@ -533,22 +629,42 @@ class Qwen:
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
                 )
+                load_kwargs = {
+                    "quantization_config": quantization_config,
+                    "device_map": "auto",
+                }
             elif quantization == "8bit":
                 quantization_config = BitsAndBytesConfig(
                     load_in_8bit=True,
+                    bnb_8bit_compute_dtype=compute_dtype,
                 )
+                load_kwargs = {
+                    "quantization_config": quantization_config,
+                    "device_map": "auto",
+                }
             else:
-                quantization_config = None
+                # No quantization - load with optimal settings
+                load_kwargs = {
+                    "torch_dtype": compute_dtype,
+                    "device_map": "auto",
+                    "low_cpu_mem_usage": True,
+                }
+
+            # Try to use Flash Attention 2 for better performance (optional)
+            if torch.cuda.is_available():
+                try:
+                    load_kwargs["attn_implementation"] = "flash_attention_2"
+                except Exception:
+                    # Flash Attention not available, will use default
+                    pass
 
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_checkpoint,
-                torch_dtype=compute_dtype,
-                device_map="auto",
-                quantization_config=quantization_config,
+                **load_kwargs,
             )
 
         result = None
-        with torch.no_grad():
+        with torch.inference_mode():
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
@@ -559,9 +675,30 @@ class Qwen:
                     messages, tokenize=False, add_generation_prompt=True
                 )
 
-                inputs = self.tokenizer([text], return_tensors="pt").to("cuda")
+                inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
 
-                generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+                # Build generation kwargs with proper parameter handling
+                generation_kwargs = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": do_sample,
+                }
+
+                # Add sampling parameters only if do_sample is True
+                if do_sample:
+                    if temperature > 0:
+                        generation_kwargs["temperature"] = temperature
+                    if top_p < 1.0:
+                        generation_kwargs["top_p"] = top_p
+                    if top_k > 0:
+                        generation_kwargs["top_k"] = top_k
+                    if min_p > 0:
+                        generation_kwargs["min_p"] = min_p
+
+                # Always apply repetition penalty if not default
+                if repetition_penalty != 1.0:
+                    generation_kwargs["repetition_penalty"] = repetition_penalty
+
+                generated_ids = self.model.generate(**inputs, **generation_kwargs)
                 generated_ids_trimmed = [
                     out_ids[len(in_ids) :]
                     for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -570,10 +707,21 @@ class Qwen:
                     generated_ids_trimmed,
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
-                    temperature=temperature,
+                )
+            except torch.cuda.OutOfMemoryError as e:
+                _clear_cuda_memory()
+                return (
+                    f"[SCG_LocalVLM] CUDA Out of Memory Error. "
+                    f"Try: 1) Enable quantization (4bit/8bit), "
+                    f"2) Reduce max_new_tokens, "
+                    f"3) Use a smaller model. "
+                    f"Error: {str(e)}",
                 )
             except Exception as e:
-                return (f"Error during model inference: {str(e)}",)
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"[SCG_LocalVLM] Error during inference:\n{error_details}")
+                return (f"[SCG_LocalVLM] Error during model inference: {str(e)}",)
             finally:
                 if not keep_model_loaded:
                     self._unload_resources()

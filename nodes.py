@@ -43,6 +43,39 @@ def _check_quantization_support():
         return False, "bitsandbytes not installed"
 
 
+def _get_gpu_info():
+    """Get GPU compute capability and check Flash Attention 2 compatibility.
+    
+    Flash Attention 2 supports SM_80-SM_90 (Ampere, Ada, Hopper).
+    Blackwell (RTX 50-series) is SM_120 and NOT supported by Flash Attention 2.
+    """
+    if not torch.cuda.is_available():
+        return None, None, False
+    
+    try:
+        device = torch.device("cuda:0")
+        props = torch.cuda.get_device_properties(device)
+        major, minor = props.major, props.minor
+        compute_cap = f"{major}.{minor}"
+        gpu_name = props.name
+        
+        # Flash Attention 2 supports SM 80-90 (Ampere, Ada, Hopper)
+        # SM 120+ is Blackwell - NOT supported by FA2
+        fa2_compatible = 80 <= (major * 10 + minor) <= 90
+        
+        return gpu_name, compute_cap, fa2_compatible
+    except Exception:
+        return None, None, False
+
+
+# Get GPU info at module load time
+_GPU_NAME, _GPU_COMPUTE_CAP, _FA2_COMPATIBLE = _get_gpu_info()
+if _GPU_NAME:
+    print(f"[SCG_LocalVLM] GPU: {_GPU_NAME} (SM {_GPU_COMPUTE_CAP})")
+    if not _FA2_COMPATIBLE:
+        print(f"[SCG_LocalVLM] NOTE: Flash Attention 2 not optimized for this GPU. SDPA recommended.")
+
+
 
 # --- Custom Models Loading ---
 CUSTOM_MODELS_FILE = os.path.join(os.path.dirname(__file__), "custom_models.json")
@@ -433,18 +466,28 @@ class QwenVL:
                     print("[SCG_LocalVLM] Loading without quantization (device_map: auto)")
 
             # Handle attention mode selection
+            # Flash Attention 2 only supports SM 80-90 (Ampere, Ada, Hopper)
+            # Blackwell (RTX 50-series, SM 120) is NOT supported - use SDPA instead
             attention_used = "default (auto)"
+            
             if attention_mode == "flash_attention_2":
-                try:
-                    import flash_attn
-                    load_kwargs["attn_implementation"] = "flash_attention_2"
-                    attention_used = "flash_attention_2"
-                    print("[SCG_LocalVLM] Using Flash Attention 2")
-                except ImportError:
-                    print("[SCG_LocalVLM] WARNING: flash_attention_2 requested but not installed")
-                    print("[SCG_LocalVLM] Install with: pip install flash-attn --no-build-isolation")
-                    print("[SCG_LocalVLM] Falling back to auto (sdpa)")
-                    attention_used = "auto (sdpa fallback)"
+                if not _FA2_COMPATIBLE:
+                    print(f"[SCG_LocalVLM] WARNING: Flash Attention 2 not compatible with {_GPU_NAME} (SM {_GPU_COMPUTE_CAP})")
+                    print("[SCG_LocalVLM] Flash Attention 2 only supports SM 80-90 (Ampere/Ada/Hopper)")
+                    print("[SCG_LocalVLM] Auto-switching to SDPA for optimal performance")
+                    load_kwargs["attn_implementation"] = "sdpa"
+                    attention_used = "sdpa (auto-fallback from FA2)"
+                else:
+                    try:
+                        import flash_attn
+                        load_kwargs["attn_implementation"] = "flash_attention_2"
+                        attention_used = "flash_attention_2"
+                        print("[SCG_LocalVLM] Using Flash Attention 2")
+                    except ImportError:
+                        print("[SCG_LocalVLM] WARNING: flash_attention_2 requested but not installed")
+                        print("[SCG_LocalVLM] Falling back to SDPA")
+                        load_kwargs["attn_implementation"] = "sdpa"
+                        attention_used = "sdpa (FA2 not installed)"
             elif attention_mode == "sdpa":
                 load_kwargs["attn_implementation"] = "sdpa"
                 attention_used = "sdpa"
@@ -454,8 +497,10 @@ class QwenVL:
                 attention_used = "eager"
                 print("[SCG_LocalVLM] Using eager attention (slowest, most compatible)")
             else:
-                # "auto" - let transformers decide (usually picks sdpa)
-                print("[SCG_LocalVLM] Using auto attention selection (will use sdpa if available)")
+                # "auto" - use SDPA for best compatibility and performance
+                load_kwargs["attn_implementation"] = "sdpa"
+                attention_used = "sdpa (auto)"
+                print("[SCG_LocalVLM] Using SDPA attention (auto-selected for best performance)")
 
             # Load the model
             model_class = _get_model_class(model, is_vl=True)
@@ -891,18 +936,28 @@ class Qwen:
                     print("[SCG_LocalVLM] Loading without quantization (device_map: auto)")
 
             # Handle attention mode selection
+            # Flash Attention 2 only supports SM 80-90 (Ampere, Ada, Hopper)
+            # Blackwell (RTX 50-series, SM 120) is NOT supported - use SDPA instead
             attention_used = "default (auto)"
+            
             if attention_mode == "flash_attention_2":
-                try:
-                    import flash_attn
-                    load_kwargs["attn_implementation"] = "flash_attention_2"
-                    attention_used = "flash_attention_2"
-                    print("[SCG_LocalVLM] Using Flash Attention 2")
-                except ImportError:
-                    print("[SCG_LocalVLM] WARNING: flash_attention_2 requested but not installed")
-                    print("[SCG_LocalVLM] Install with: pip install flash-attn --no-build-isolation")
-                    print("[SCG_LocalVLM] Falling back to auto (sdpa)")
-                    attention_used = "auto (sdpa fallback)"
+                if not _FA2_COMPATIBLE:
+                    print(f"[SCG_LocalVLM] WARNING: Flash Attention 2 not compatible with {_GPU_NAME} (SM {_GPU_COMPUTE_CAP})")
+                    print("[SCG_LocalVLM] Flash Attention 2 only supports SM 80-90 (Ampere/Ada/Hopper)")
+                    print("[SCG_LocalVLM] Auto-switching to SDPA for optimal performance")
+                    load_kwargs["attn_implementation"] = "sdpa"
+                    attention_used = "sdpa (auto-fallback from FA2)"
+                else:
+                    try:
+                        import flash_attn
+                        load_kwargs["attn_implementation"] = "flash_attention_2"
+                        attention_used = "flash_attention_2"
+                        print("[SCG_LocalVLM] Using Flash Attention 2")
+                    except ImportError:
+                        print("[SCG_LocalVLM] WARNING: flash_attention_2 requested but not installed")
+                        print("[SCG_LocalVLM] Falling back to SDPA")
+                        load_kwargs["attn_implementation"] = "sdpa"
+                        attention_used = "sdpa (FA2 not installed)"
             elif attention_mode == "sdpa":
                 load_kwargs["attn_implementation"] = "sdpa"
                 attention_used = "sdpa"
@@ -912,8 +967,10 @@ class Qwen:
                 attention_used = "eager"
                 print("[SCG_LocalVLM] Using eager attention (slowest, most compatible)")
             else:
-                # "auto" - let transformers decide (usually picks sdpa)
-                print("[SCG_LocalVLM] Using auto attention selection (will use sdpa if available)")
+                # "auto" - use SDPA for best compatibility and performance
+                load_kwargs["attn_implementation"] = "sdpa"
+                attention_used = "sdpa (auto)"
+                print("[SCG_LocalVLM] Using SDPA attention (auto-selected for best performance)")
 
             # Load the model
             print(f"[SCG_LocalVLM] Loading model from {self.model_checkpoint}")

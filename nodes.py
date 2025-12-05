@@ -858,85 +858,54 @@ class Qwen:
             compute_dtype = torch.bfloat16 if self.bf16_support else torch.float16
             print(f"[SCG_LocalVLM] Using compute dtype: {compute_dtype}")
 
-            # Build load_kwargs - START WITH MINIMAL SETTINGS
+            # Build load_kwargs - SIMPLIFIED for maximum performance
             load_kwargs = {
-                "low_cpu_mem_usage": True,
+                "torch_dtype": compute_dtype,
             }
             
-            # Handle quantization - DON'T set torch_dtype when quantizing
             if quantization == "4bit":
-                # For single GPU, use explicit device placement instead of "auto"
-                device_map = {"": 0} if torch.cuda.device_count() == 1 else "auto"
-                
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=compute_dtype,
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_storage=compute_dtype,  # Store in same dtype as compute
                 )
                 load_kwargs["quantization_config"] = quantization_config
-                load_kwargs["device_map"] = device_map
-                print(f"[SCG_LocalVLM] Loading with 4-bit quantization (device_map: {device_map})")
+                load_kwargs["device_map"] = "auto"
+                print(f"[SCG_LocalVLM] Loading with 4-bit quantization")
                 
             elif quantization == "8bit":
-                device_map = {"": 0} if torch.cuda.device_count() == 1 else "auto"
-                
                 quantization_config = BitsAndBytesConfig(
                     load_in_8bit=True,
-                    bnb_8bit_compute_dtype=compute_dtype,
-                    llm_int8_threshold=6.0,
                 )
                 load_kwargs["quantization_config"] = quantization_config
-                load_kwargs["device_map"] = device_map
-                print(f"[SCG_LocalVLM] Loading with 8-bit quantization (device_map: {device_map})")
+                load_kwargs["device_map"] = "auto"
+                print(f"[SCG_LocalVLM] Loading with 8-bit quantization")
                 
             else:
-                # For non-quantized models on single GPU: use direct device placement
-                load_kwargs["torch_dtype"] = compute_dtype
-                if torch.cuda.device_count() == 1:
-                    load_kwargs["device_map"] = {"":  "cuda:0"}
-                    print("[SCG_LocalVLM] Loading without quantization (device_map: cuda:0)")
-                else:
-                    load_kwargs["device_map"] = "auto"
-                    print("[SCG_LocalVLM] Loading without quantization (device_map: auto)")
+                # Non-quantized: NO device_map - use native PyTorch loading
+                print("[SCG_LocalVLM] Loading without quantization (native PyTorch)")
 
-            # Handle attention mode selection
-            # Flash Attention 2 only supports SM 80-90 (Ampere, Ada, Hopper)
-            # Blackwell (RTX 50-series, SM 120) is NOT supported - use SDPA instead
-            attention_used = "default (auto)"
-            
-            if attention_mode == "flash_attention_2":
-                if not _FA2_COMPATIBLE:
-                    print(f"[SCG_LocalVLM] WARNING: Flash Attention 2 not compatible with {_GPU_NAME} (SM {_GPU_COMPUTE_CAP})")
-                    print("[SCG_LocalVLM] Flash Attention 2 only supports SM 80-90 (Ampere/Ada/Hopper)")
-                    print("[SCG_LocalVLM] Auto-switching to SDPA for optimal performance")
+            # Handle attention mode - simplified
+            if attention_mode == "flash_attention_2" and _FA2_COMPATIBLE:
+                try:
+                    import flash_attn
+                    load_kwargs["attn_implementation"] = "flash_attention_2"
+                    attention_used = "flash_attention_2"
+                except ImportError:
                     load_kwargs["attn_implementation"] = "sdpa"
-                    attention_used = "sdpa (auto-fallback from FA2)"
-                else:
-                    try:
-                        import flash_attn
-                        load_kwargs["attn_implementation"] = "flash_attention_2"
-                        attention_used = "flash_attention_2"
-                        print("[SCG_LocalVLM] Using Flash Attention 2")
-                    except ImportError:
-                        print("[SCG_LocalVLM] WARNING: flash_attention_2 requested but not installed")
-                        print("[SCG_LocalVLM] Falling back to SDPA")
-                        load_kwargs["attn_implementation"] = "sdpa"
-                        attention_used = "sdpa (FA2 not installed)"
-            elif attention_mode == "sdpa":
+                    attention_used = "sdpa"
+            elif attention_mode == "sdpa" or (attention_mode == "flash_attention_2" and not _FA2_COMPATIBLE):
                 load_kwargs["attn_implementation"] = "sdpa"
                 attention_used = "sdpa"
-                print("[SCG_LocalVLM] Using SDPA attention")
             elif attention_mode == "eager":
                 load_kwargs["attn_implementation"] = "eager"
                 attention_used = "eager"
-                print("[SCG_LocalVLM] Using eager attention (slowest, most compatible)")
             else:
-                # "auto" - use SDPA for best compatibility and performance
                 load_kwargs["attn_implementation"] = "sdpa"
-                attention_used = "sdpa (auto)"
-                print("[SCG_LocalVLM] Using SDPA attention (auto-selected for best performance)")
+                attention_used = "sdpa"
+            
+            print(f"[SCG_LocalVLM] Using {attention_used} attention")
 
             # Load the model
             print(f"[SCG_LocalVLM] Loading model from {self.model_checkpoint}")
@@ -949,9 +918,11 @@ class Qwen:
                 
                 load_time = time.time() - load_start
                 
-                # Set model to eval mode for inference
+                # For non-quantized: move to GPU
+                if quantization == "none":
+                    self.model = self.model.cuda()
+                
                 self.model.eval()
-                print("[SCG_LocalVLM]   Model set to eval mode")
                 
                 # Print comprehensive model info
                 print(f"[SCG_LocalVLM] Model loaded successfully in {load_time:.2f}s")

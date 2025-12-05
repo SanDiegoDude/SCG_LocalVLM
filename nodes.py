@@ -44,13 +44,13 @@ def _check_quantization_support():
 
 
 def _get_gpu_info():
-    """Get GPU compute capability and check Flash Attention 2 compatibility.
+    """Get GPU compute capability and check Flash Attention 2 optimization status.
     
-    Flash Attention 2 supports SM_80-SM_90 (Ampere, Ada, Hopper).
-    Blackwell (RTX 50-series) is SM_120 and NOT supported by Flash Attention 2.
+    Returns info about whether FA2 is likely OPTIMAL for this GPU (hint, not blocker).
+    FA2 may still work on newer GPUs even if not fully optimized yet.
     """
     if not torch.cuda.is_available():
-        return None, None, False
+        return None, None, True  # Assume compatible if we can't check
     
     try:
         device = torch.device("cuda:0")
@@ -59,21 +59,21 @@ def _get_gpu_info():
         compute_cap = f"{major}.{minor}"
         gpu_name = props.name
         
-        # Flash Attention 2 supports SM 80-90 (Ampere, Ada, Hopper)
-        # SM 120+ is Blackwell - NOT supported by FA2
-        fa2_compatible = 80 <= (major * 10 + minor) <= 90
+        # FA2 is optimized for SM 80-90 (Ampere, Ada, Hopper)
+        # Newer architectures (SM 120+ Blackwell) may not have optimized kernels yet
+        # But this could change with future FA2 updates
+        sm_version = major * 10 + minor
+        fa2_optimized = 80 <= sm_version <= 90
         
-        return gpu_name, compute_cap, fa2_compatible
+        return gpu_name, compute_cap, fa2_optimized
     except Exception:
-        return None, None, False
+        return None, None, True  # Assume compatible if we can't check
 
 
 # Get GPU info at module load time
-_GPU_NAME, _GPU_COMPUTE_CAP, _FA2_COMPATIBLE = _get_gpu_info()
+_GPU_NAME, _GPU_COMPUTE_CAP, _FA2_OPTIMIZED = _get_gpu_info()
 if _GPU_NAME:
     print(f"[SCG_LocalVLM] GPU: {_GPU_NAME} (SM {_GPU_COMPUTE_CAP})")
-    if not _FA2_COMPATIBLE:
-        print(f"[SCG_LocalVLM] NOTE: Flash Attention 2 not optimized for this GPU. SDPA recommended.")
 
 
 
@@ -427,7 +427,6 @@ class QwenVL:
             }
             
             if quantization == "4bit":
-                # Quantization requires device_map for bitsandbytes
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=compute_dtype,
@@ -435,7 +434,8 @@ class QwenVL:
                     bnb_4bit_use_double_quant=True,
                 )
                 load_kwargs["quantization_config"] = quantization_config
-                load_kwargs["device_map"] = "auto"  # Let Accelerate handle quantized loading
+                # Use explicit GPU placement to avoid Accelerate memory management overhead
+                load_kwargs["device_map"] = {"": 0} if torch.cuda.device_count() == 1 else "auto"
                 print(f"[SCG_LocalVLM] Loading with 4-bit quantization")
                 
             elif quantization == "8bit":
@@ -443,35 +443,41 @@ class QwenVL:
                     load_in_8bit=True,
                 )
                 load_kwargs["quantization_config"] = quantization_config
-                load_kwargs["device_map"] = "auto"
+                load_kwargs["device_map"] = {"": 0} if torch.cuda.device_count() == 1 else "auto"
                 print(f"[SCG_LocalVLM] Loading with 8-bit quantization")
                 
             else:
-                # Non-quantized: NO device_map - use native PyTorch loading for speed
-                # Model will load to CPU first, then we move to GPU
-                print("[SCG_LocalVLM] Loading without quantization (native PyTorch)")
+                # Non-quantized: load directly to GPU for maximum speed
+                load_kwargs["device_map"] = {"": "cuda:0"}
+                print("[SCG_LocalVLM] Loading without quantization")
 
-            # Handle attention mode - simplified
-            if attention_mode == "flash_attention_2" and _FA2_COMPATIBLE:
+            # Handle attention mode
+            if attention_mode == "flash_attention_2":
                 try:
                     import flash_attn
                     load_kwargs["attn_implementation"] = "flash_attention_2"
                     attention_used = "flash_attention_2"
+                    if not _FA2_OPTIMIZED:
+                        print(f"[SCG_LocalVLM] Using Flash Attention 2 (may not be optimal for {_GPU_NAME or 'this GPU'})")
+                    else:
+                        print("[SCG_LocalVLM] Using Flash Attention 2")
                 except ImportError:
+                    print("[SCG_LocalVLM] flash-attn not installed, using SDPA instead")
                     load_kwargs["attn_implementation"] = "sdpa"
                     attention_used = "sdpa"
-            elif attention_mode == "sdpa" or (attention_mode == "flash_attention_2" and not _FA2_COMPATIBLE):
+            elif attention_mode == "sdpa":
                 load_kwargs["attn_implementation"] = "sdpa"
                 attention_used = "sdpa"
+                print("[SCG_LocalVLM] Using SDPA attention")
             elif attention_mode == "eager":
                 load_kwargs["attn_implementation"] = "eager"
                 attention_used = "eager"
+                print("[SCG_LocalVLM] Using eager attention")
             else:
-                # auto - use sdpa as default
-                load_kwargs["attn_implementation"] = "sdpa"  
+                # auto - use sdpa as default (best compatibility + good performance)
+                load_kwargs["attn_implementation"] = "sdpa"
                 attention_used = "sdpa"
-            
-            print(f"[SCG_LocalVLM] Using {attention_used} attention")
+                print("[SCG_LocalVLM] Using SDPA attention (auto)")
 
             # Load the model
             model_class = _get_model_class(model, is_vl=True)
@@ -490,10 +496,6 @@ class QwenVL:
                     )
                 
                 load_time = time.time() - load_start
-                
-                # For non-quantized models: move to GPU using native PyTorch
-                if quantization == "none":
-                    self.model = self.model.cuda()
                 
                 # Set model to eval mode
                 self.model.eval()

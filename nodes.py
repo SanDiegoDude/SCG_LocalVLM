@@ -520,7 +520,15 @@ class QwenVL:
                 
                 # Set model to eval mode
                 self.model.eval()
-                
+
+                # CRITICAL: Clear CUDA cache and reset internal state to avoid random slowness
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    # Reset any accumulated gradients or state
+                    for param in self.model.parameters():
+                        param.grad = None
+
                 # Print comprehensive model info
                 print(f"[SCG_LocalVLM] Model loaded successfully in {load_time:.2f}s")
                 print(f"[SCG_LocalVLM]   Device: {self.model.device}")
@@ -721,6 +729,11 @@ class QwenVL:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                     gpu_mem_before = torch.cuda.memory_allocated(0) / 1024**3
+
+                # CRITICAL: Force CUDA sync and clear cache before generation to avoid random slowness
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
 
                 print(f"[SCG_LocalVLM] Starting generation with {input_token_count} input tokens...")
                 gen_start = time.time()

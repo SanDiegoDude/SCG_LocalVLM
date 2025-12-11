@@ -529,24 +529,13 @@ class QwenVL:
                     for param in self.model.parameters():
                         param.grad = None
 
-                # PERFORMANCE: Compile model for faster generation (2-3x speedup possible)
-                # torch.compile optimizes the model graph for the specific hardware
-                try:
-                    if not hasattr(self.model, '_is_compiled'):
-                        print(f"[SCG_LocalVLM] Compiling model for optimized generation...")
-                        compile_start = time.time()
-                        # Use reduce-overhead mode for maximum throughput
-                        self.model = torch.compile(
-                            self.model,
-                            mode="reduce-overhead",
-                            fullgraph=False,
-                            dynamic=False
-                        )
-                        self.model._is_compiled = True
-                        compile_time = time.time() - compile_start
-                        print(f"[SCG_LocalVLM] Model compiled in {compile_time:.2f}s")
-                except Exception as e:
-                    print(f"[SCG_LocalVLM] Could not compile model (will use eager mode): {str(e)}")
+                # PERFORMANCE: Set optimal torch backends
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True  # Auto-tune kernels
+                torch.backends.cuda.enable_flash_sdp(True)  # Enable flash SDPA
+                torch.backends.cuda.enable_mem_efficient_sdp(True)  # Enable memory-efficient SDPA
+                torch.backends.cuda.enable_math_sdp(False)  # Disable slow math SDPA fallback
 
                 # Print comprehensive model info
                 print(f"[SCG_LocalVLM] Model loaded successfully in {load_time:.2f}s")

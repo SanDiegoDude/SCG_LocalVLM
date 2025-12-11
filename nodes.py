@@ -526,25 +526,41 @@ class QwenVL:
                 print(f"[SCG_LocalVLM]   Device: {self.model.device}")
                 print(f"[SCG_LocalVLM]   Dtype: {self.model.dtype}")
                 print(f"[SCG_LocalVLM]   Attention: {attention_used}")
-                
+
                 # Verify actual attention implementation
                 if hasattr(self.model.config, '_attn_implementation'):
                     actual_attn = self.model.config._attn_implementation
                     print(f"[SCG_LocalVLM]   Attention (verified): {actual_attn}")
-                
+                    if actual_attn != attention_used:
+                        print(f"[SCG_LocalVLM]   WARNING: Requested {attention_used} but got {actual_attn}!")
+
+                # GPU memory diagnostics
+                if torch.cuda.is_available():
+                    mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                    print(f"[SCG_LocalVLM]   GPU Memory: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
+
+                # Verify model is on GPU for non-quantized
+                if quantization == "none":
+                    # Check first parameter device
+                    first_param = next(self.model.parameters())
+                    if not first_param.is_cuda:
+                        print(f"[SCG_LocalVLM]   WARNING: Model is on {first_param.device}, not CUDA!")
+                        print(f"[SCG_LocalVLM]   This will cause VERY slow inference!")
+
                 # Show quantization info
                 if quantization != "none":
                     print(f"[SCG_LocalVLM]   Quantization: {quantization}")
                     if hasattr(self.model, 'hf_device_map'):
                         print(f"[SCG_LocalVLM]   Device map: {self.model.hf_device_map}")
-                    
+
                     # Check if model is actually quantized
                     is_quantized = False
                     for name, param in self.model.named_parameters():
                         if hasattr(param, 'quant_state'):
                             is_quantized = True
                             break
-                    
+
                     if is_quantized:
                         print(f"[SCG_LocalVLM]   Quantization: VERIFIED (layers are quantized)")
                     else:
@@ -700,28 +716,44 @@ class QwenVL:
                     print(f"[SCG_LocalVLM]   Time: {gen_time:.2f}s")
                     print(f"[SCG_LocalVLM]   Speed: {tokens_per_sec:.2f} tokens/sec")
 
+                    # Performance benchmarks for RTX 5090 + Qwen3-VL-4B
+                    # Based on actual testing - see context.md
+                    expected_speeds = {
+                        "none": {"min": 15.0, "typical": 16.5, "attn": "sdpa or flash_attention_2"},
+                        "4bit": {"min": 10.0, "typical": 50.0, "attn": "eager (quantization doesn't work well with FA2)"},
+                        "8bit": {"min": 8.0, "typical": 40.0, "attn": "eager"},
+                    }
+
+                    # Check if performance is below expected
+                    if quantization in expected_speeds:
+                        expected = expected_speeds[quantization]
+                        if tokens_per_sec < expected["min"]:
+                            print(f"[SCG_LocalVLM] ⚠️  WARNING: Very slow generation speed!")
+                            print(f"[SCG_LocalVLM]   Expected: {expected['typical']:.1f} tok/s")
+                            print(f"[SCG_LocalVLM]   Got: {tokens_per_sec:.2f} tok/s ({tokens_per_sec/expected['typical']*100:.1f}% of expected)")
+                            print(f"[SCG_LocalVLM]   Recommended attention: {expected['attn']}")
+                            print(f"[SCG_LocalVLM] Possible causes:")
+                            print(f"[SCG_LocalVLM]   1. Model loaded on CPU instead of GPU (check warnings above)")
+                            print(f"[SCG_LocalVLM]   2. Wrong attention mode (try '{expected['attn']}')")
+                            print(f"[SCG_LocalVLM]   3. Other processes using GPU (check nvidia-smi)")
+                            if quantization == "none":
+                                print(f"[SCG_LocalVLM]   4. Try 'sdpa' instead of 'flash_attention_2' (often faster)")
+                            elif quantization == "4bit":
+                                print(f"[SCG_LocalVLM]   4. Quantization kernels issue (pip install bitsandbytes --upgrade)")
+
                     # Show timing breakdown if images were processed
                     if image_count > 0:
                         total_prep_time = img_convert_time + vision_time + processor_time
                         print(f"[SCG_LocalVLM] Timing Breakdown:")
                         print(f"[SCG_LocalVLM]   Image conversion: {img_convert_time:.3f}s")
                         print(f"[SCG_LocalVLM]   Vision processing: {vision_time:.3f}s")
-                        print(f"[SCG_LocalVLM]   Image embedding:  {processor_time:.3f}s ← SLOWEST (can be optimized)")
+                        print(f"[SCG_LocalVLM]   Image embedding:  {processor_time:.3f}s")
                         print(f"[SCG_LocalVLM]   Text generation:  {gen_time:.3f}s")
                         print(f"[SCG_LocalVLM]   Total prep time:  {total_prep_time:.3f}s")
                         if processor_time > 1.0:
                             print(f"[SCG_LocalVLM] TIP: Image embedding is slow. Try:")
                             print(f"[SCG_LocalVLM]   - Use 'low' or 'medium' image_resolution for faster processing")
                             print(f"[SCG_LocalVLM]   - Current: {image_resolution}")
-
-                    # Add performance analysis
-                    if quantization == "4bit" and tokens_per_sec < 10:
-                        print(f"[SCG_LocalVLM] WARNING: 4bit performance unusually slow!")
-                        print(f"[SCG_LocalVLM] Expected: 40-60 tok/s, Got: {tokens_per_sec:.2f} tok/s")
-                        print(f"[SCG_LocalVLM] Possible issues:")
-                        print(f"[SCG_LocalVLM]   - Quantization kernels not properly compiled")
-                        print(f"[SCG_LocalVLM]   - CUDA/PyTorch version mismatch")
-                        print(f"[SCG_LocalVLM]   - Try: pip install bitsandbytes --upgrade")
 
                 result = self.processor.batch_decode(
                     generated_ids_trimmed,
@@ -978,25 +1010,41 @@ class Qwen:
                 print(f"[SCG_LocalVLM]   Device: {self.model.device}")
                 print(f"[SCG_LocalVLM]   Dtype: {self.model.dtype}")
                 print(f"[SCG_LocalVLM]   Attention: {attention_used}")
-                
+
                 # Verify actual attention implementation
                 if hasattr(self.model.config, '_attn_implementation'):
                     actual_attn = self.model.config._attn_implementation
                     print(f"[SCG_LocalVLM]   Attention (verified): {actual_attn}")
-                
+                    if actual_attn != attention_used:
+                        print(f"[SCG_LocalVLM]   WARNING: Requested {attention_used} but got {actual_attn}!")
+
+                # GPU memory diagnostics
+                if torch.cuda.is_available():
+                    mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                    print(f"[SCG_LocalVLM]   GPU Memory: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
+
+                # Verify model is on GPU for non-quantized
+                if quantization == "none":
+                    # Check first parameter device
+                    first_param = next(self.model.parameters())
+                    if not first_param.is_cuda:
+                        print(f"[SCG_LocalVLM]   WARNING: Model is on {first_param.device}, not CUDA!")
+                        print(f"[SCG_LocalVLM]   This will cause VERY slow inference!")
+
                 # Show quantization info
                 if quantization != "none":
                     print(f"[SCG_LocalVLM]   Quantization: {quantization}")
                     if hasattr(self.model, 'hf_device_map'):
                         print(f"[SCG_LocalVLM]   Device map: {self.model.hf_device_map}")
-                    
+
                     # Check if model is actually quantized
                     is_quantized = False
                     for name, param in self.model.named_parameters():
                         if hasattr(param, 'quant_state'):
                             is_quantized = True
                             break
-                    
+
                     if is_quantized:
                         print(f"[SCG_LocalVLM]   Quantization: VERIFIED (layers are quantized)")
                     else:

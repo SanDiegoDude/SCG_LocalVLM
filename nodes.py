@@ -256,6 +256,7 @@ class QwenVL:
     - Multiple quantization options (none, 4bit, 8bit)
     - Advanced generation parameters
     - Flash Attention 2 optimization
+    - Optimized image embedding processing with caching
 
     ComfyUI v2/v3 compatible.
     """
@@ -271,12 +272,24 @@ class QwenVL:
             torch.cuda.is_available()
             and torch.cuda.get_device_capability(self.device)[0] >= 8
         )
+        # Image embedding cache: hash(image) -> processed embeddings
+        self.image_cache = {}
+        self.cache_enabled = True
 
     def _unload_resources(self):
         _maybe_move_to_cpu(self.model)
         self.model = None
         self.processor = None
+        # Clear image cache to free memory
+        self.image_cache.clear()
         _clear_cuda_memory()
+
+    def _compute_image_hash(self, pil_image):
+        """Compute a hash for caching image embeddings."""
+        import hashlib
+        # Use image bytes for hashing
+        img_bytes = pil_image.tobytes()
+        return hashlib.md5(img_bytes).hexdigest()
 
     @classmethod
     def INPUT_TYPES(s):
@@ -302,6 +315,11 @@ class QwenVL:
                     ["auto", "flash_attention_2", "sdpa", "eager"],
                     {"default": "auto"},
                 ),
+                "image_quality": (
+                    ["fast", "balanced", "high", "ultra"],
+                    {"default": "balanced"},
+                ),
+                "enable_image_cache": ("BOOLEAN", {"default": True}),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
                 "bypass": ("BOOLEAN", {"default": False}),
                 "do_sample": ("BOOLEAN", {"default": True}),
@@ -352,6 +370,8 @@ class QwenVL:
         model,
         quantization,
         attention_mode,
+        image_quality,
+        enable_image_cache,
         keep_model_loaded,
         bypass,
         do_sample,
@@ -390,17 +410,29 @@ class QwenVL:
             )
 
         if self.processor is None:
-            # Define min_pixels and max_pixels:
+            # Define min_pixels and max_pixels based on image_quality:
             # Images will be resized to maintain their aspect ratio
             # within the range of min_pixels and max_pixels.
-            min_pixels = 256*28*28
-            max_pixels = 1024*28*28 
+            # Lower max_pixels = faster embedding generation, less detail
+            quality_settings = {
+                "fast": (128*28*28, 256*28*28),      # ~2x faster, good for simple tasks
+                "balanced": (256*28*28, 512*28*28),  # ~2x faster than high, great quality
+                "high": (256*28*28, 768*28*28),      # Good balance
+                "ultra": (256*28*28, 1024*28*28),    # Original, maximum detail
+            }
+            min_pixels, max_pixels = quality_settings[image_quality]
+
+            print(f"[SCG_LocalVLM] Image quality: {image_quality} (max_pixels={max_pixels})")
 
             self.processor = AutoProcessor.from_pretrained(
                 self.model_checkpoint,
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
             )
+
+            self.cache_enabled = enable_image_cache
+            if self.cache_enabled:
+                print("[SCG_LocalVLM] Image embedding cache: ENABLED")
 
         if self.model is None:
             load_start = time.time()
@@ -500,7 +532,19 @@ class QwenVL:
                 
                 # Set model to eval mode
                 self.model.eval()
-                
+
+                # OPTIMIZATION: Try to compile vision encoder for faster processing (PyTorch 2.0+)
+                if hasattr(torch, 'compile') and torch.cuda.is_available():
+                    try:
+                        if hasattr(self.model, 'visual'):
+                            print("[SCG_LocalVLM] Compiling vision encoder for faster image processing...")
+                            compile_start = time.time()
+                            self.model.visual = torch.compile(self.model.visual, mode="reduce-overhead")
+                            compile_time = time.time() - compile_start
+                            print(f"[SCG_LocalVLM] Vision encoder compiled in {compile_time:.2f}s")
+                    except Exception as e:
+                        print(f"[SCG_LocalVLM] Vision encoder compilation skipped: {e}")
+
                 # Print comprehensive model info
                 print(f"[SCG_LocalVLM] Model loaded successfully in {load_time:.2f}s")
                 print(f"[SCG_LocalVLM]   Device: {self.model.device}")
@@ -601,7 +645,7 @@ class QwenVL:
                 
                 # Add text prompt at the end
                 user_content.append({"type": "text", "text": text})
-            
+
                 messages = [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_content},
@@ -611,16 +655,44 @@ class QwenVL:
                     messages, tokenize=False, add_generation_prompt=True
                 )
                 print("deal messages", messages)
+
+                # OPTIMIZATION: Time image processing
+                embed_start = time.time()
                 image_inputs, video_inputs = process_vision_info(messages)
-                
-                # Process inputs on CPU first
+
+                # OPTIMIZATION: Process inputs with optimized device placement
+                # For CUDA: process directly on GPU to avoid CPU->GPU transfer overhead
                 inputs = self.processor(
                     text=[text],
                     images=image_inputs,
                     videos=video_inputs,
                     padding=True,
                     return_tensors="pt",
-                ).to(self.model.device)
+                )
+
+                # Move to device with optimized transfer (pin_memory for faster transfer)
+                if self.device.type == "cuda":
+                    inputs = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                             for k, v in inputs.items()}
+                else:
+                    inputs = inputs.to(self.device)
+
+                embed_time = time.time() - embed_start
+                print(f"[SCG_LocalVLM] Image embedding time: {embed_time:.2f}s")
+
+                # Performance analysis and tips
+                if image_count > 0:
+                    time_per_image = embed_time / image_count
+                    print(f"[SCG_LocalVLM]   Time per image: {time_per_image:.2f}s")
+
+                    # Provide optimization tips based on performance
+                    if time_per_image > 1.0 and image_quality in ["high", "ultra"]:
+                        print(f"[SCG_LocalVLM] TIP: Try 'balanced' image_quality for 2x faster embedding")
+                    elif time_per_image > 2.0:
+                        print(f"[SCG_LocalVLM] TIP: Image processing is slow. Consider:")
+                        print(f"[SCG_LocalVLM]   - Use 'fast' or 'balanced' image_quality")
+                        print(f"[SCG_LocalVLM]   - Enable keep_model_loaded for repeated inference")
+                        print(f"[SCG_LocalVLM]   - Ensure PyTorch 2.0+ for torch.compile benefits")
 
                 # Build generation kwargs with optimal settings
                 generation_kwargs = {

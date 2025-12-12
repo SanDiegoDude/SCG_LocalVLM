@@ -60,6 +60,20 @@ if _NEEDS_PATCH:
     # Apply the patch
     Qwen3VLForConditionalGeneration.prepare_inputs_for_generation = _patched_prepare_inputs_for_generation
 
+# PERFORMANCE: Set PyTorch thread count for optimal CPU parallelism
+# Can be overridden via environment variable: PYTORCH_THREADS
+# Low thread count causes CPU bottleneck -> low GPU utilization
+_DEFAULT_THREADS = 8
+_THREAD_COUNT = int(os.environ.get('PYTORCH_THREADS', _DEFAULT_THREADS))
+try:
+    torch.set_num_threads(_THREAD_COUNT)
+    torch.set_num_interop_threads(_THREAD_COUNT)
+    print(f"[SCG_LocalVLM] PyTorch threads set to {_THREAD_COUNT} (override with PYTORCH_THREADS env var)")
+except RuntimeError as e:
+    # Already set by ComfyUI or another module
+    print(f"[SCG_LocalVLM] Thread count already set: {e}")
+    print(f"[SCG_LocalVLM] Current threads: {torch.get_num_threads()}, interop: {torch.get_num_interop_threads()}")
+
 def _check_quantization_support():
     """Check if quantization kernels are available and working."""
     if not torch.cuda.is_available():
@@ -373,10 +387,6 @@ class QwenVL:
                     ["low (256x28x28)", "medium (512x28x28)", "high (768x28x28)", "ultra (1024x28x28)"],
                     {"default": "medium (512x28x28)"},
                 ),
-                "thread_count": (
-                    ["1", "2", "4", "8", "12", "16"],
-                    {"default": "8"},
-                ),
             },
             "optional": {
                 "image1": ("IMAGE",),
@@ -410,7 +420,6 @@ class QwenVL:
         max_new_tokens,
         seed,
         image_resolution,
-        thread_count,
         image1=None,
         image2=None,
         image3=None,
@@ -541,14 +550,6 @@ class QwenVL:
                 load_kwargs["attn_implementation"] = "sdpa"
                 attention_used = "sdpa"
                 print("[SCG_LocalVLM] Using SDPA attention (auto)")
-
-            # PERFORMANCE: Optimize CPU thread usage to prevent GPU starvation
-            # Low thread count causes CPU bottleneck -> low GPU utilization
-            # User-configurable thread count for optimal CPU parallelism during generation
-            threads = int(thread_count)
-            torch.set_num_threads(threads)
-            torch.set_num_interop_threads(threads)
-            print(f"[SCG_LocalVLM] PyTorch threads: {torch.get_num_threads()}, interop: {torch.get_num_interop_threads()}")
 
             # Load the model
             model_class = _get_model_class(model, is_vl=True)

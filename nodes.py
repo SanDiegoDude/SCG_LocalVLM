@@ -373,6 +373,10 @@ class QwenVL:
                     ["low (256x28x28)", "medium (512x28x28)", "high (768x28x28)", "ultra (1024x28x28)"],
                     {"default": "medium (512x28x28)"},
                 ),
+                "thread_count": (
+                    ["1", "2", "4", "8", "12", "16"],
+                    {"default": "8"},
+                ),
             },
             "optional": {
                 "image1": ("IMAGE",),
@@ -406,6 +410,7 @@ class QwenVL:
         max_new_tokens,
         seed,
         image_resolution,
+        thread_count,
         image1=None,
         image2=None,
         image3=None,
@@ -539,9 +544,10 @@ class QwenVL:
 
             # PERFORMANCE: Optimize CPU thread usage to prevent GPU starvation
             # Low thread count causes CPU bottleneck -> low GPU utilization
-            # Set to 8 threads for optimal CPU parallelism during generation
-            torch.set_num_threads(8)
-            torch.set_num_interop_threads(8)
+            # User-configurable thread count for optimal CPU parallelism during generation
+            threads = int(thread_count)
+            torch.set_num_threads(threads)
+            torch.set_num_interop_threads(threads)
             print(f"[SCG_LocalVLM] PyTorch threads: {torch.get_num_threads()}, interop: {torch.get_num_interop_threads()}")
 
             # Load the model

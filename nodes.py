@@ -537,6 +537,13 @@ class QwenVL:
                 attention_used = "sdpa"
                 print("[SCG_LocalVLM] Using SDPA attention (auto)")
 
+            # PERFORMANCE: Optimize CPU thread usage to prevent GPU starvation
+            # Low thread count causes CPU bottleneck -> low GPU utilization
+            # Set to 8 threads for optimal CPU parallelism during generation
+            torch.set_num_threads(8)
+            torch.set_num_interop_threads(8)
+            print(f"[SCG_LocalVLM] PyTorch threads: {torch.get_num_threads()}, interop: {torch.get_num_interop_threads()}")
+
             # Load the model
             model_class = _get_model_class(model, is_vl=True)
             print(f"[SCG_LocalVLM] Loading {model_class} model from {self.model_checkpoint}")

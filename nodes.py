@@ -1207,7 +1207,6 @@ class Qwen:
                     generation_kwargs["repetition_penalty"] = repetition_penalty
 
                 # Start timing
-                import time
                 gen_start = time.time()
 
                 generated_ids = self.model.generate(**inputs, **generation_kwargs)
